@@ -6,70 +6,63 @@
 
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import java.io.BufferedReader
+import java.io.InputStreamReader
 
-// plugin versioning
-version = "0.0.13"
+// disable default versioning
+version = "0.0.10"
 
-// base of output jar name
-val OUTPUT_JAR_NAME = "nodes"
+// jvm target
+val JVM = 17 // 1.8 for 8, 11 for 11
 
 // target will be set to minecraft version by cli input parameter
-var target = ""
+var target = "1.21"
+var kotlinVersion = "2.0.20"
+fun executeCommand(command: String): String {
+    val process = Runtime.getRuntime().exec(command)
+    val reader = BufferedReader(InputStreamReader(process.inputStream))
+    return reader.readText().trim()
+}
 
 plugins {
     // Apply the Kotlin JVM plugin to add support for Kotlin.
-    id("org.jetbrains.kotlin.jvm") version "1.6.10"
-    id("com.github.johnrengelman.shadow") version "7.1.2"
+    id("org.jetbrains.kotlin.jvm") version "2.0.20"
+    id("com.gradleup.shadow") version "8.3.2"
+
     // maven() // no longer needed in gradle 7
 
-    // include paperweight, but DO NOT APPLY BY DEFAULT...
-    // we need imports, but only conditionally apply it for 1.17+ builds
-    // for 1.16.5, we don't want to apply because not supported, it
-    // does not allow building unless a bundle version is applied,
-    // which does not exist for 1.16.5, so its impossible to build with
-    // paperweight plugin enabled on 1.16.5
-    // https://stackoverflow.com/questions/62579114/how-to-optionally-apply-some-plugins-using-kotlin-dsl-and-plugins-block-with-gra
+    // Apply the application plugin to add support for building a CLI application.
+    application
 
-    // i fucking hate gradle and cant configure this
-    // just manually uncomment
-
-    // USE FOR 1.16.5, UNCOMMENT WHEN NEEDED :^(
-    // id("io.papermc.paperweight.userdev") version "1.3.8" apply false
-    
-    // USE FOR 1.18.2 (DEFAULT)
-    id("io.papermc.paperweight.userdev") version "1.3.8"
+    `maven-publish`
 }
 
 repositories {
-    // Use jcenter for resolving dependencies.
-    // You can declare any Maven/Ivy/file repository here.
-    jcenter()
-    
+    gradlePluginPortal()
+
     maven { // paper
-        url = uri("https://papermc.io/repo/repository/maven-public/")
+        url = uri("https://repo.papermc.io/repository/maven-public/")
     }
     maven { // protocol lib
         url = uri("https://repo.dmulloy2.net/nexus/repository/public/")
     }
+
+    // fast block edit
+    maven {
+        url = uri("https://repo.repsy.io/mvn/tlm920/minecraft")
+    }
+}
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(JVM))
+    }
 }
 
 configurations {
-    // config required for shadowed dependencies
-    create("shadowImplementation") {
+    create("resolvableImplementation") {
         isCanBeResolved = true
         isCanBeConsumed = true
-    }
-
-    // Special configuration with priority over compileOnly.
-    // Required so we can include NMS and bukkit as dependency,
-    // without overriding the paper API (which has slight differences
-    // in api). See:
-    // https://github.com/gradle/gradle/issues/10502
-    // https://stackoverflow.com/questions/31698510/can-i-force-the-order-of-dependencies-in-my-classpath-with-gradle/47953373#47953373
-    create("compileOnlyPriority") {
-        isCanBeResolved = true
-        isCanBeConsumed = true
-        sourceSets["main"].compileClasspath = configurations["compileOnlyPriority"] + sourceSets["main"].compileClasspath
     }
 }
 
@@ -78,29 +71,17 @@ dependencies {
     compileOnly(platform("org.jetbrains.kotlin:kotlin-bom"))
 
     // Use the Kotlin JDK 8 standard library.
-    compileOnly("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
-    if ( project.hasProperty("no-kotlin") == false ) { // shadow kotlin unless "no-kotlin" flag
-        configurations["shadowImplementation"]("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
+    if (!project.hasProperty("no-kotlin")) { // shadow kotlin unless "no-kotlin" flag
+        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
+    } else {
+        compileOnly("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
     }
 
     // google json
-    compileOnly("com.google.code.gson:gson:2.10") {
-        version {
-            strictly("2.10")
-        }
-    }
-    // shadows gson dependency
-    configurations["shadowImplementation"]("com.google.code.gson:gson:2.10") {
-        version {
-            strictly("2.10")
-        }
-    }
-    // force overrides gson dependency inside paper mc
-    configurations["compileOnlyPriority"]("com.google.code.gson:gson:2.10") {
-        version {
-            strictly("2.10")
-        }
-    }
+    implementation("com.google.code.gson:gson:2.8.9")
+
+    // protocol lib (nametag packets)
+    compileOnly("com.comphenix.protocol:ProtocolLib:4.5.0")
 
     // Use the Kotlin test library.
     testImplementation("org.jetbrains.kotlin:kotlin-test")
@@ -108,38 +89,23 @@ dependencies {
     // Use the Kotlin JUnit integration.
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit")
 
-    if ( project.hasProperty("1.16") == true ) {
-        target = "1.16.5"
-        // java must be up to 16 for 1.16
-        java.toolchain.languageVersion.set(JavaLanguageVersion.of(16))
-        // nms version specific source
-        sourceSets["main"].java.srcDir("src/nms/v1_16_R3")
-        // spigot/paper api
-        compileOnly(files("./lib/spigot-1.16.5.jar"))
-        configurations["compileOnlyPriority"]("com.destroystokyo.paper:paper-api:1.16.5-R0.1-SNAPSHOT")
-    } else if ( project.hasProperty("1.18") == true ) {
-        target = "1.18.2"
-        // java must be 17 for 1.18
-        java.toolchain.languageVersion.set(JavaLanguageVersion.of(17))
-        // nms version specific source
-        sourceSets["main"].java.srcDir("src/nms/v1_18_R2")
-        // spigot/paper api
-        paperDevBundle("1.18.2-R0.1-SNAPSHOT") // contains 1.18.2 nms classes
-        compileOnly("io.papermc.paper:paper-api:1.18.2-R0.1-SNAPSHOT")
+// TODO: resolve fast block edit build issues
+//    when (target) {
+//        "1.16" -> implementation("phonon.blockedit:fast-block-edit:1.16-SNAPSHOT")
+//        "1.17" -> implementation("phonon.blockedit:fast-block-edit:1.17-SNAPSHOT")
+//        "1.18" -> implementation("phonon.blockedit:fast-block-edit:1.18-SNAPSHOT")
+//        "1.19" -> implementation("phonon.blockedit:fast-block-edit:1.19-SNAPSHOT")
+//        "1.20" -> implementation("phonon.blockedit:fast-block-edit:1.20-SNAPSHOT")
+//        "1.21" -> implementation("phonon.blockedit:fast-block-edit:1.21-SNAPSHOT")
+//        else -> implementation("phonon.blockedit:fast-block-edit:1.21-SNAPSHOT") // fallback to latest
+//    }
 
-        tasks {
-            assemble {
-                // must write it like below because in 1.16 config, reobfJar does not exist
-                // so the simpler definition below wont compile
-                // dependsOn(reobfJar) // won't compile :^(
-                dependsOn(project.tasks.first { it.name.contains("reobfJar") })
-            }
-        }
+    compileOnly("io.papermc.paper:paper-api:1.20.2-R0.1-SNAPSHOT")
+}
 
-        tasks.named("reobfJar") {
-            base.archivesBaseName = "${OUTPUT_JAR_NAME}-${target}"
-        }
-    }
+application {
+    // Define the main class for the application.
+    mainClass.set("phonon.nodes.NodesPluginKt")
 }
 
 tasks.withType<KotlinCompile> {
@@ -149,34 +115,44 @@ tasks.withType<KotlinCompile> {
 tasks {
     named<ShadowJar>("shadowJar") {
         // verify valid target minecraft version
-        doFirst {
-            val supportedMinecraftVersions = setOf("1.16.5", "1.18.2")
-            if ( !supportedMinecraftVersions.contains(target) ) {
-                throw Exception("Invalid Minecraft version! Supported versions are: 1.16, 1.18")
-            }
-        }
+//        doFirst {
+//            val supportedMinecraftVersions = setOf("1.12", "1.16", "1.18")
+//            if ( !supportedMinecraftVersions.contains(target) ) {
+//                throw Exception("Invalid Minecraft version! Supported versions are: 1.12, 1.16, 1.18")
+//            }
+//        }
 
-        classifier = ""
-        configurations = mutableListOf(project.configurations.named("shadowImplementation").get()) as List<FileCollection>
-        relocate("com.google", "nodes.shadow.com.google")
+        //relocate("phonon.blockedit", "nodes.lib.blockedit")
     }
 }
 
 tasks {
+    processResources {
+        val props = mapOf(
+                "version" to project.version,
+        )
+        inputs.properties(props)
+        filesMatching("plugin.yml") {
+            expand(props)
+        }
+    }
+
     build {
         dependsOn(shadowJar)
     }
-    
+
     test {
         testLogging.showStandardStreams = true
     }
-}
 
-gradle.taskGraph.whenReady {
-    tasks {
-        named<ShadowJar>("shadowJar") {
-            baseName = "${OUTPUT_JAR_NAME}-${target}"
-            minimize()
+    shadowJar {
+        relocate("com.google", "nodes.shadow.gson")
+        if (project.hasProperty("prod")) {
+            archiveBaseName.set("${project.name}-${target}-${version}")
+            minimize() // FOR PRODUCTION USE MINIMIZE
+        }
+        else {
+            archiveFileName.set("${project.name}-${target}-${version}-DEV-${executeCommand("git rev-parse --short HEAD")}.jar")
         }
     }
 }

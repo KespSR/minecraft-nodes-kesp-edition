@@ -158,6 +158,10 @@ public class AllyCommand : CommandExecutor, TabCompleter {
                 AllianceRequest.ACCEPTED -> {
                     Message.broadcast("${thisSideName} has formed an alliance with ${otherSideName}")
                 }
+
+                null -> {
+                    Message.error(player, "Unknown error while requesting alliance.")
+                }
             }
         }
         else {
