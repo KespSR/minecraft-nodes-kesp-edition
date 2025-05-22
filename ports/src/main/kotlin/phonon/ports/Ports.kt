@@ -56,13 +56,11 @@ import org.bukkit.event.player.PlayerBucketEmptyEvent
 import org.bukkit.scheduler.BukkitTask
 import org.bukkit.scheduler.BukkitRunnable
 
-import org.bukkit.craftbukkit.v1_18_R2.entity.CraftEntity
-import org.bukkit.craftbukkit.v1_18_R2.entity.CraftPlayer
-import net.minecraft.network.protocol.game.ClientboundAddEntityPacket
-
 import phonon.nodes.Nodes
 import phonon.nodes.constants.DiplomaticRelationship
 import phonon.nodes.objects.Town
+
+import phonon.ports.PortRequests
 
 
 /**
@@ -156,21 +154,18 @@ internal fun playerHasPortModifyPermission(player: Player, port: Port): Boolean 
     return false
 }
 
-public val PORT_COMMANDS: List<String> = listOf(
-    "help",
-    "list",
-    "info",
-    "allow",
-    "fee",
-    "warp"
+public val PORT_COMMANDS = listOf(
+    "help", "list", "info", "allow", "fee", "warp",
+    "apply"          // <-- NUEVO
 )
 
-public val PORT_ADMIN_COMMANDS: List<String> = listOf(
-    "help",
-    "reload",
-    "createbeacon",
-    "removebeacon"
+
+public val PORT_ADMIN_COMMANDS = listOf(
+    "help", "reload", "createbeacon", "removebeacon",
+    "create", "requests", "accept", "deny",
+    "delete"           // ← NUEVO
 )
+
 
 public object PortCommand: CommandExecutor, TabCompleter {
 
@@ -183,13 +178,14 @@ public object PortCommand: CommandExecutor, TabCompleter {
 
         // parse subcommand
         val arg = args[0].lowercase()
-        when ( arg ) {
+        when (arg) {
             "help" -> printHelp(sender)
             "list" -> list(sender)
             "info" -> info(sender, args)
             "allow" -> allow(sender, args)
             "fee" -> fee(sender, args)
             "warp" -> doWarp(sender, args)
+            "apply" -> apply(sender, args)
             else -> {
                 Message.error(sender, "Invalid port command")
             }
@@ -241,6 +237,18 @@ public object PortCommand: CommandExecutor, TabCompleter {
                         return listOf("confirm")
                     }
                 }
+                "apply" -> when {
+                    args.size == 2 -> return listOf("<nombre>")          // nombre libre: no sugerimos nada concreto
+                    args.size >= 3 -> {
+                        val ya = args.drop(2).map { it.lowercase() }
+                        // sugiere sólo los grupos que aún no se han escrito
+                        return filterByStart(
+                            Ports.portGroups.map { it.name }.filter { it !in ya },
+                            args.last()
+                        )
+                    }
+                }
+
             }
         }
         
@@ -447,6 +455,40 @@ public object PortCommand: CommandExecutor, TabCompleter {
 
         Ports.doWarp(player, portName, confirmation)
     }
+    /**
+     * /port apply <nombreDeseado> <grupo1> [grupo2 …]
+     */
+    private fun apply(sender: CommandSender, args: Array<String>) {
+        val player = sender as? Player ?: return Message.error(sender, "Solo en juego")
+        if (args.size < 3) {                                // mínimo nombre + un grupo
+            Message.error(sender, "Uso: /port apply <nombre> <grupo1> [grupo2 …]")
+            return
+        }
+
+        val desiredName = args[1].lowercase()
+        val groupList   = args.drop(2).map { it.lowercase() }.distinct()
+
+        // comprueba que todos los grupos existen
+        val invalid = groupList.firstOrNull { g -> Ports.portGroups.none { it.name == g } }
+        if (invalid != null) {
+            Message.error(sender, "El grupo $invalid no existe")
+            return
+        }
+
+        val loc = player.location
+        val req = PortRequest(
+            player   = player.name,
+            portName = desiredName,
+            x        = loc.blockX,
+            z        = loc.blockZ,
+            groups   = groupList
+        )
+        PortRequests.add(req)
+        Message.print(player, "${ChatColor.GREEN}Solicitud enviada (admins la revisarán)")
+    }
+
+    /* ===== /port apply <group> ===== */
+    /** ===== /portadmin delete <name> ===== */
 }
 
 
@@ -465,25 +507,68 @@ public object PortAdminCommand: CommandExecutor, TabCompleter {
         // parse subcommand
         val arg = args[0].lowercase()
         when ( arg ) {
-            "help" -> printHelp(sender)
-            "reload" -> reload(sender)
+            "help"      -> printHelp(sender)
+            "reload"    -> reload(sender)
             "createbeacon" -> createbeacon(sender)
             "removebeacon" -> removebeacon(sender)
-            else -> {
-                Message.error(sender, "Invalid port admin command")
-            }
+            "create"    -> createPortCmd(sender, args)
+            "requests"  -> showRequests(sender)
+            "accept"    -> acceptRequest(sender, args)
+            "deny"      -> denyRequest(sender, args)
+            "delete"    -> deletePortCmd(sender, args)   // ← NUEVO
+            else        -> Message.error(sender, "Invalid port admin command")
         }
 
         return true
     }
 
-    override fun onTabComplete(sender: CommandSender, command: Command, alias: String, args: Array<String>): List<String> {
-        if ( args.size == 1 ) {
+    override fun onTabComplete(
+        sender: CommandSender,
+        command: Command,
+        alias: String,
+        args: Array<String>
+    ): List<String> {
+
+        /* 1er argumento → sub-comando */
+        if (args.size == 1) {
             return filterByStart(PORT_ADMIN_COMMANDS, args[0])
         }
 
-        return listOf()
+        /* 2º+ argumento: depende del sub-comando */
+        when (args[0].lowercase()) {
+
+            /* /portadmin delete <nombrePuerto> */
+            "delete" -> if (args.size == 2) {
+                return filterByStart(Ports.portNames, args[1])
+            }
+
+            /* /portadmin create <name> <x> <z> <group> */
+            "create" -> when (args.size) {
+                2 -> return listOf("<name>")
+                3 -> return listOf("<x>")
+                4 -> return listOf("<z>")
+                else -> {             // grupos: sugerir restantes
+                    val ya = args.drop(4).map { it.lowercase() }
+                    return filterByStart(
+                        Ports.portGroups.map { it.name }.filter { it !in ya },
+                        args.last()
+                    )
+                }
+            }
+
+
+            /* /portadmin accept|deny <uuid> */
+            "accept", "deny" -> if (args.size == 2) {
+                return PortRequests.all().map { it.id.toString() }
+                    .filter { it.startsWith(args[1], ignoreCase = true) }
+            }
+
+            /* /portadmin requests, reload, createbeacon, removebeacon: sin args extra */
+        }
+
+        return emptyList()   // nada que sugerir
     }
+
 
     private fun printHelp(sender: CommandSender) {
         Message.print(sender, "${ChatColor.AQUA}${ChatColor.BOLD}[Ports] for Mineman 1.18.2")
@@ -494,11 +579,96 @@ public object PortAdminCommand: CommandExecutor, TabCompleter {
         return
     }
 
+    private fun createPortCmd(sender: CommandSender, args: Array<String>) {
+        if (!sender.isOp) { Message.error(sender, "Solo OP"); return }
+
+        if (args.size < 5) {
+            Message.error(sender, "Uso: /portadmin create <name> <x> <z> <grupo1> [grupo2 …]")
+            return
+        }
+
+        val name   = args[1].lowercase()
+        val x      = args[2].toIntOrNull()
+        val z      = args[3].toIntOrNull()
+        val groups = args.drop(4).map { it.lowercase() }.distinct()
+
+        if (x == null || z == null) {
+            Message.error(sender, "Coordenadas inválidas"); return
+        }
+
+        if (Ports.createPort(name, x, z, groups)) {
+            Message.print(sender, "${ChatColor.GREEN}Puerto $name creado")
+        } else {
+            Message.error(sender, "Error creando puerto")
+        }
+    }
+
+    private fun deletePortCmd(sender: CommandSender, args: Array<String>) {
+        if (!sender.isOp) { Message.error(sender, "Solo OP"); return }
+
+        if (args.size < 2) {
+            Message.error(sender, "Uso: /portadmin delete <nombrePuerto>")
+            return
+        }
+        val name = args[1].lowercase()
+
+        if (!Ports.portNames.contains(name)) {
+            Message.error(sender, "No existe un puerto llamado '$name'")
+            return
+        }
+
+        if (Ports.deletePort(name)) {
+            Message.print(sender, "${ChatColor.YELLOW}Puerto '$name' eliminado")
+        } else {
+            Message.error(sender, "No se pudo eliminar el puerto")
+        }
+    }
+
+    /* ===== /portadmin requests ===== */
+    private fun showRequests(sender: CommandSender) {
+        if (!sender.isOp) { Message.error(sender, "Solo OP"); return }
+        PortRequests.sendListToAdmin(sender)
+    }
+
+    /* ===== /portadmin accept <id> ===== */
+    private fun acceptRequest(sender: CommandSender, args: Array<String>) {
+        if (!sender.isOp) { Message.error(sender, "Solo OP"); return }
+        if (args.size < 2) { Message.error(sender, "Uso: /portadmin accept <id>"); return }
+        val id = runCatching { UUID.fromString(args[1]) }.getOrNull()
+            ?: return Message.error(sender, "ID inválido")
+
+        val req = PortRequests.all().find { it.id == id }
+            ?: return Message.error(sender, "No existe esa solicitud")
+
+        /* creamos el puerto con el mismo nombre que el jugador + índice para evitar duplicados */
+        val portName = req.portName.lowercase()
+        Ports.createPort(portName, req.x, req.z, req.groups, false)
+
+        PortRequests.remove(id)
+        Message.print(sender, "${ChatColor.GREEN}Solicitud aceptada y puerto $portName creado")
+    }
+
+    /* ===== /portadmin deny <id> ===== */
+    private fun denyRequest(sender: CommandSender, args: Array<String>) {
+        if (!sender.isOp) { Message.error(sender, "Solo OP"); return }
+        if (args.size < 2) { Message.error(sender, "Uso: /portadmin deny <id>"); return }
+
+        val id = runCatching { UUID.fromString(args[1]) }.getOrNull()
+            ?: return Message.error(sender, "ID inválido")
+
+        if (PortRequests.all().none { it.id == id }) {
+            Message.error(sender, "No existe esa solicitud"); return
+        }
+        PortRequests.remove(id)
+        Message.print(sender, "${ChatColor.YELLOW}Solicitud denegada")
+    }
+
     /**
      * Reload plugin config (op only)
      */
     private fun reload(sender: CommandSender) {
         Ports.reload()
+        PortRequests.load()
         Message.print(sender, "[Ports] reloaded")
     }
     
@@ -702,7 +872,7 @@ public object Ports {
 
     // allow port warp without a boat
     public var allowWarpWithoutBoat: Boolean = false
-    
+
     // protect port blocks in distance around center
     public var protectDistance: Int = 6
 
@@ -710,7 +880,7 @@ public object Ports {
     public var defaultAllowAlly: Boolean = true
     public var defaultAllowNeutral: Boolean = false
     public var defaultAllowEnemy: Boolean = false
-    
+
     // default material and fee cost
     public var defaultCostMaterial: Material = Material.GOLD_INGOT
     public var defaultCostAlly: Int = 0
@@ -751,22 +921,22 @@ public object Ports {
 
     // main ports container
     public var ports: HashMap<String, Port> = hashMapOf()
-    
+
     // saved list of all port names (i.e. keys to ports hashmap)
     public var portNames: List<String> = listOf()
-    
+
     // port groups, PortGroup only contains list of port names not objects themselves
     public var portGroups: List<PortGroup> = listOf()
-    
+
     // map chunk coords -> port, assumes one chunk only has 1 port
     public var chunkToPort: HashMap<ChunkCoord, Port> = hashMapOf()
-    
+
     // lookup for chunks that contain a port
     // private var chunksWithPort: HashSet<Coord> = hashSetOf()
-    
+
     // map of player -> task for warping
     public var playerWarpTasks: HashMap<UUID, BukkitTask> = hashMapOf()
-    
+
     // require save
     private var needsSave: Boolean = false
 
@@ -787,19 +957,19 @@ public object Ports {
         Ports.saveTask?.cancel()
         Ports.savePortData(Ports.pathSave)
     }
-    
+
     /**
      * Load engine settings config, update settings
      */
     public fun loadConfig() {
         val plugin = Ports.plugin
-        if ( plugin === null ) {
+        if (plugin === null) {
             return
         }
 
         // get config file
         val configFile = File(plugin.getDataFolder().getPath(), "config.yml")
-        if ( !configFile.exists() ) {
+        if (!configFile.exists()) {
             plugin.getLogger().info("No config found: generating default config.yml")
             plugin.saveDefaultConfig()
         }
@@ -812,32 +982,39 @@ public object Ports {
 
         Ports.maxDistanceFromPortToWarp = config.getDouble("maxDistanceFromPortToWarp", Ports.maxDistanceFromPortToWarp)
         Ports.maxDistanceFromPortToWarpSquared = Ports.maxDistanceFromPortToWarp * Ports.maxDistanceFromPortToWarp
-        
-        Ports.baseWarpTime = config.getDouble("baseWarpTime", Ports.BASE_WARP_TIME) * 20.0 // time is in seconds, convert to ticks
+
+        Ports.baseWarpTime =
+            config.getDouble("baseWarpTime", Ports.BASE_WARP_TIME) * 20.0 // time is in seconds, convert to ticks
         Ports.allowWarpWithoutBoat = config.getBoolean("allowWarpWithoutBoat", Ports.allowWarpWithoutBoat)
-        
+
         Ports.protectDistance = config.getInt("protectDistance", Ports.protectDistance)
 
         Ports.defaultAllowAlly = config.getBoolean("defaultAllowAlly", Ports.defaultAllowAlly)
         Ports.defaultAllowNeutral = config.getBoolean("defaultAllowNeutral", Ports.defaultAllowNeutral)
         Ports.defaultAllowEnemy = config.getBoolean("defaultAllowEnemy", Ports.defaultAllowEnemy)
 
-        Ports.defaultCostMaterial = Material.matchMaterial(config.getString("defaultCostMaterial") ?: Ports.defaultCostMaterial.toString()) ?: Ports.defaultCostMaterial
+        Ports.defaultCostMaterial =
+            Material.matchMaterial(config.getString("defaultCostMaterial") ?: Ports.defaultCostMaterial.toString())
+                ?: Ports.defaultCostMaterial
         Ports.defaultCostAlly = config.getInt("defaultCostAlly", Ports.defaultCostAlly)
         Ports.defaultCostNeutral = config.getInt("defaultCostNeutral", Ports.defaultCostNeutral)
         Ports.defaultCostEnemy = config.getInt("defaultCostEnemy", Ports.defaultCostEnemy)
         Ports.maxCost = config.getInt("maxCost", Ports.maxCost)
 
-        Ports.beaconPillarMaterial = Material.matchMaterial(config.getString("beaconPillarMaterial") ?: Ports.beaconPillarMaterial.toString()) ?: Ports.beaconPillarMaterial
+        Ports.beaconPillarMaterial =
+            Material.matchMaterial(config.getString("beaconPillarMaterial") ?: Ports.beaconPillarMaterial.toString())
+                ?: Ports.beaconPillarMaterial
         Ports.beaconPillarHeight = config.getInt("beaconPillarHeight", Ports.beaconPillarHeight)
         Ports.beaconPillarStartY = config.getInt("beaconPillarStartY", Ports.beaconPillarStartY)
-        Ports.beaconLightMaterial = Material.matchMaterial(config.getString("beaconLightMaterial") ?: Ports.beaconLightMaterial.toString()) ?: Ports.beaconPillarMaterial
+        Ports.beaconLightMaterial =
+            Material.matchMaterial(config.getString("beaconLightMaterial") ?: Ports.beaconLightMaterial.toString())
+                ?: Ports.beaconPillarMaterial
         Ports.beaconLightHeight = config.getInt("beaconLightHeight", Ports.beaconLightHeight)
 
         Ports.checkSavePeriod = config.getLong("checkSavePeriod", Ports.checkSavePeriod)
 
-        Ports.dirSave = config.getString("dirSave")?.let{ p -> Paths.get(p) } ?: Ports.dirSave
-        Ports.pathSave = config.getString("pathSave")?.let{ p -> Ports.dirSave.resolve(p) } ?: Ports.pathSave
+        Ports.dirSave = config.getString("dirSave")?.let { p -> Paths.get(p) } ?: Ports.dirSave
+        Ports.pathSave = config.getString("pathSave")?.let { p -> Ports.dirSave.resolve(p) } ?: Ports.pathSave
     }
 
     /**
@@ -845,13 +1022,13 @@ public object Ports {
      */
     public fun loadPorts() {
         val plugin = Ports.plugin
-        if ( plugin === null ) {
+        if (plugin === null) {
             return
         }
 
         // get port config file
         val configFile = File(plugin.getDataFolder().getPath(), "ports.yml")
-        if ( !configFile.exists() ) {
+        if (!configFile.exists()) {
             plugin.getLogger().info("Saving default ports.yml")
             plugin.saveResource("ports.yml", false)
             return
@@ -867,50 +1044,51 @@ public object Ports {
             val chunkToPort: HashMap<ChunkCoord, Port> = hashMapOf()
 
             // load port groups
-            val groupNames: List<String> = config.getList("groups")?.map{ v -> v.toString().lowercase() }?.toList() ?: listOf()
-            
+            val groupNames: List<String> =
+                config.getList("groups")?.map { v -> v.toString().lowercase() }?.toList() ?: listOf()
+
             // temp structure to hold ports for each group
             val portGroupsList: ArrayList<ArrayList<String>> = ArrayList(groupNames.size)
 
             // map port group name -> array index
             val groupNameToIndex: HashMap<String, Int> = hashMapOf()
-            for ( (i, name) in groupNames.withIndex() ) {
+            for ((i, name) in groupNames.withIndex()) {
                 groupNameToIndex.put(name, i)
                 portGroupsList.add(ArrayList())
             }
 
             // load ports
             val portsSection = config.getConfigurationSection("ports")
-            if ( portsSection !== null ) {
-                for ( portNameRaw in portsSection.getKeys(false) ) {
+            if (portsSection !== null) {
+                for (portNameRaw in portsSection.getKeys(false)) {
                     val portConfig = portsSection.getConfigurationSection(portNameRaw)
-                    if ( portConfig === null ) {
+                    if (portConfig === null) {
                         continue
                     }
 
                     // convert raw key to lowercase
                     val portName = portNameRaw.lowercase()
 
-                    if ( !portConfig.isInt("x") || !portConfig.isInt("z") ) {
+                    if (!portConfig.isInt("x") || !portConfig.isInt("z")) {
                         continue
                     }
                     val locX = portConfig.getInt("x")
                     val locZ = portConfig.getInt("z")
-                    
+
                     // convert group names to lowercase
-                    val groupNames: List<String> = if ( portConfig.isList("group") ) {
-                        portConfig.getStringList("group").map{ s -> s.lowercase() }
-                    } else if ( portConfig.isString("group") ) {
+                    val groupNames: List<String> = if (portConfig.isList("group")) {
+                        portConfig.getStringList("group").map { s -> s.lowercase() }
+                    } else if (portConfig.isString("group")) {
                         listOf(portConfig.getString("group")!!.lowercase())
                     } else {
                         listOf()
                     }
-                    
+
                     // map group names to group indices
                     val groups: ArrayList<Int> = ArrayList()
-                    for ( name in groupNames ) {
+                    for (name in groupNames) {
                         val index = groupNameToIndex.get(name)
-                        if ( index !== null ) {
+                        if (index !== null) {
                             groups.add(index)
                             portGroupsList.getOrNull(index)?.add(portName)
                         } else {
@@ -920,9 +1098,12 @@ public object Ports {
 
                     val isPublic = portConfig.getBoolean("public", true)
 
-                    val warpTimeModifier = portConfig.getDouble("warpTimeModifier", 0.0) * 20.0 // time in seconds, convert to ticks
+                    val warpTimeModifier =
+                        portConfig.getDouble("warpTimeModifier", 0.0) * 20.0 // time in seconds, convert to ticks
 
-                    val costMaterial = Material.matchMaterial(config.getString("costMaterial") ?: Ports.defaultCostMaterial.toString()) ?: Ports.defaultCostMaterial
+                    val costMaterial =
+                        Material.matchMaterial(config.getString("costMaterial") ?: Ports.defaultCostMaterial.toString())
+                            ?: Ports.defaultCostMaterial
                     val costAlly = config.getInt("costAlly", Ports.defaultCostAlly).coerceIn(0, Ports.maxCost)
                     val costNeutral = config.getInt("costNeutral", Ports.defaultCostNeutral).coerceIn(0, Ports.maxCost)
                     val costEnemy = config.getInt("costEnemy", Ports.defaultCostEnemy).coerceIn(0, Ports.maxCost)
@@ -962,17 +1143,19 @@ public object Ports {
                     chunkToPort.put(c2, port)
                     chunkToPort.put(c3, port)
                     chunkToPort.put(c4, port)
-                    
+
                     ports.put(portName, port)
                     portNames.add(portName)
                 }
 
                 // finish port groups
-                for ( (i, portList) in portGroupsList.withIndex() ) {
-                    portGroups.add(PortGroup(
-                        groupNames[i],
-                        portList.toList()
-                    ))
+                for ((i, portList) in portGroupsList.withIndex()) {
+                    portGroups.add(
+                        PortGroup(
+                            groupNames[i],
+                            portList.toList()
+                        )
+                    )
                 }
             }
 
@@ -983,8 +1166,7 @@ public object Ports {
 
             // save to json
             Ports.saveToJson(Ports.pathDynmap)
-        }
-        catch ( err: Exception ) {
+        } catch (err: Exception) {
             err.printStackTrace()
         }
     }
@@ -995,20 +1177,21 @@ public object Ports {
      */
     public fun saveToJson(dir: Path) {
         // create save directory
-        if ( !Files.exists(dir) ) {
+        if (!Files.exists(dir)) {
             return
         }
         var i = 0
         // create json string
         val portsJson = StringBuilder("{\"meta\":{\"type\":\"ports\"},\"ports\":{")
-        for ( (name, port) in Ports.ports ) {
-            val portGroupNames = port.groups.map{x -> Ports.portGroups.get(x)}.map{x -> "\"${x.name}\""}.joinToString(",")
+        for ((name, port) in Ports.ports) {
+            val portGroupNames =
+                port.groups.map { x -> Ports.portGroups.get(x) }.map { x -> "\"${x.name}\"" }.joinToString(",")
             portsJson.append("\"${name}\":{")
             portsJson.append("\"groups\":[${portGroupNames}],")
             portsJson.append("\"x\":${port.locX},")
             portsJson.append("\"z\":${port.locZ}")
             portsJson.append("}")
-            if ( i < Ports.ports.size - 1 ) {
+            if (i < Ports.ports.size - 1) {
                 portsJson.append(",")
             }
             i += 1
@@ -1028,13 +1211,13 @@ public object Ports {
 
         // stop old shit
         val saveTask = Ports.saveTask
-        if ( saveTask !== null ) {
+        if (saveTask !== null) {
             saveTask.cancel()
             Ports.saveTask = null
         }
-        
+
         // sync save
-        if ( Ports.needsSave ) {
+        if (Ports.needsSave) {
             Ports.savePortData(Ports.pathSave)
             Ports.needsSave = false
         }
@@ -1061,8 +1244,8 @@ public object Ports {
      */
     public fun startSaveTask() {
         Ports.saveTask?.cancel()
-        
-        Ports.saveTask = Bukkit.getScheduler().runTaskTimer(Ports.plugin!!, object: Runnable {
+
+        Ports.saveTask = Bukkit.getScheduler().runTaskTimer(Ports.plugin!!, object : Runnable {
             override public fun run() {
                 Ports.saveTick()
             }
@@ -1073,10 +1256,10 @@ public object Ports {
      * Periodic save tick, schedules an async save if needsSave == true
      */
     public fun saveTick() {
-        if ( Ports.needsSave ) {
+        if (Ports.needsSave) {
             Ports.needsSave = false
 
-            Bukkit.getScheduler().runTaskAsynchronously(Ports.plugin!!, object: Runnable {
+            Bukkit.getScheduler().runTaskAsynchronously(Ports.plugin!!, object : Runnable {
                 override public fun run() {
                     Ports.savePortData(Ports.pathSave)
                 }
@@ -1092,9 +1275,9 @@ public object Ports {
     public fun savePortData(path: Path) {
         val portsToSave: ArrayList<PortSaveState> = arrayListOf()
 
-        for ( name in Ports.portNames ) {
+        for (name in Ports.portNames) {
             val port = ports.get(name)
-            if ( port !== null && !port.isPublic ) {
+            if (port !== null && !port.isPublic) {
                 val saveState = PortSaveState(
                     name,
                     intArrayOf(port.costAlly, port.costNeutral, port.costEnemy),
@@ -1106,7 +1289,12 @@ public object Ports {
 
         val json = gson.toJson(SavedPorts(portsToSave.toList()))
         val buffer = ByteBuffer.wrap(json.toString().toByteArray())
-        val fileChannel = AsynchronousFileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        val fileChannel = AsynchronousFileChannel.open(
+            path,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING
+        );
         val operation = fileChannel.write(buffer, 0);
         operation.get()
     }
@@ -1116,7 +1304,7 @@ public object Ports {
      */
     public fun loadPortData(path: Path) {
         try {
-            if ( !Files.exists(path) ) {
+            if (!Files.exists(path)) {
                 System.err.println("No saved data at ${path}")
                 return
             }
@@ -1126,24 +1314,22 @@ public object Ports {
             val gson = Ports.gson
             val savedPortData = gson.fromJson(json, SavedPorts::class.java)
 
-            for ( portData in savedPortData.ports ) {
+            for (portData in savedPortData.ports) {
                 try {
                     val portName = portData.name
-                    Ports.ports.get(portName)?.let{ p -> 
+                    Ports.ports.get(portName)?.let { p ->
                         p.costAlly = portData.costs[0]
                         p.costNeutral = portData.costs[1]
-                        p.costEnemy = portData.costs[2]       
+                        p.costEnemy = portData.costs[2]
                         p.allowAlly = portData.access[0]
                         p.allowNeutral = portData.access[1]
-                        p.allowEnemy = portData.access[2]       
+                        p.allowEnemy = portData.access[2]
                     }
-                }
-                catch ( err: Exception ) {
+                } catch (err: Exception) {
                     err.printStackTrace()
                 }
             }
-        }
-        catch ( err: Exception ) {
+        } catch (err: Exception) {
             err.printStackTrace()
         }
     }
@@ -1152,15 +1338,13 @@ public object Ports {
      * Allow group to warp to port
      */
     public fun setPortAccess(port: Port, group: String, setting: Boolean) {
-        if ( group == "ally" ) {
+        if (group == "ally") {
             port.allowAlly = setting
             Ports.needsSave = true
-        }
-        else if ( group == "neutral" ) {
+        } else if (group == "neutral") {
             port.allowNeutral = setting
             Ports.needsSave = true
-        }
-        else if ( group == "enemy" ) {
+        } else if (group == "enemy") {
             port.allowEnemy = setting
             Ports.needsSave = true
         }
@@ -1170,15 +1354,13 @@ public object Ports {
      * Set port warp fee for group
      */
     public fun setPortCost(port: Port, group: String, fee: Int) {
-        if ( group == "ally" ) {
+        if (group == "ally") {
             port.costAlly = fee
             Ports.needsSave = true
-        }
-        else if ( group == "neutral" ) {
+        } else if (group == "neutral") {
             port.costNeutral = fee
             Ports.needsSave = true
-        }
-        else if ( group == "enemy" ) {
+        } else if (group == "enemy") {
             port.costEnemy = fee
             Ports.needsSave = true
         }
@@ -1188,12 +1370,12 @@ public object Ports {
      * Check if two ports share a group
      */
     public fun shareGroups(port1: Port, port2: Port): Boolean {
-        val shared: BooleanArray = BooleanArray(Ports.portGroups.size, {_ -> false})
-        for ( i in port1.groups ) {
+        val shared: BooleanArray = BooleanArray(Ports.portGroups.size, { _ -> false })
+        for (i in port1.groups) {
             shared[i] = true
         }
-        for ( i in port2.groups ) {
-            if ( shared[i] ) {
+        for (i in port2.groups) {
+            if (shared[i]) {
                 return true
             }
         }
@@ -1207,20 +1389,20 @@ public object Ports {
      * Else, return territory town (may be null)
      */
     public fun getPortOwner(port: Port): Town? {
-        if ( port.isPublic ) {
+        if (port.isPublic) {
             return null
         }
 
         val territory = Nodes.getTerritoryFromChunkCoords(port.chunkX, port.chunkZ)
-        if ( territory === null ) {
+        if (territory === null) {
             return null
         }
-        
+
         val occupier = territory.occupier
-        if ( occupier !== null ) {
+        if (occupier !== null) {
             return occupier
         }
-        
+
         return territory.town
     }
 
@@ -1230,27 +1412,27 @@ public object Ports {
     public fun createBeacons() {
         // get default world for now
         val world = Bukkit.getWorlds().getOrNull(0)
-        if ( world === null ) {
+        if (world === null) {
             return
         }
 
-        for ( port in Ports.ports.values ) {
+        for (port in Ports.ports.values) {
             val x = port.locX
             val z = port.locZ
             val yStart = Ports.beaconPillarStartY
             val yEnd = Ports.beaconPillarStartY + Ports.beaconPillarHeight
             val yLightEnd = yEnd + Ports.beaconLightHeight
-            
+
             println("[Ports] creating beacon at ${x} ${z} (from ${yStart} to ${yLightEnd}")
-            
+
             // create pillar
-            for ( y in yStart until yEnd ) {
+            for (y in yStart until yEnd) {
                 val block = world.getBlockAt(x, y, z)
                 block.setType(Ports.beaconPillarMaterial)
             }
 
             // create light
-            for ( y in yEnd until yLightEnd ) {
+            for (y in yEnd until yLightEnd) {
                 val block = world.getBlockAt(x, y, z)
                 block.setType(Ports.beaconLightMaterial)
             }
@@ -1263,11 +1445,11 @@ public object Ports {
     public fun removeBeacons() {
         // get default world for now
         val world = Bukkit.getWorlds().getOrNull(0)
-        if ( world === null ) {
+        if (world === null) {
             return
         }
 
-        for ( port in Ports.ports.values ) {
+        for (port in Ports.ports.values) {
             val x = port.locX
             val z = port.locZ
             val yStart = Ports.beaconPillarStartY
@@ -1276,13 +1458,12 @@ public object Ports {
             println("[Ports] removing beacon at ${x} ${z} (from ${yStart} to ${yLightEnd}")
 
             // remove pillar + light
-            for ( y in yStart until yLightEnd ) {
+            for (y in yStart until yLightEnd) {
                 val block = world.getBlockAt(x, y, z)
                 val adjacent = block.getRelative(-1, 0, 0)
-                if ( adjacent.type == Material.WATER ) {
+                if (adjacent.type == Material.WATER) {
                     block.setType(Material.WATER)
-                }
-                else {
+                } else {
                     block.setType(Material.AIR)
                 }
             }
@@ -1300,7 +1481,7 @@ public object Ports {
         val playerUuid = player.getUniqueId()
 
         // check if player is already warping
-        if ( playerWarpTasks.contains(playerUuid) ) {
+        if (playerWarpTasks.contains(playerUuid)) {
             Message.print(player, "${ChatColor.RED}You are already warping somewhere")
             return
         }
@@ -1309,14 +1490,13 @@ public object Ports {
         val locPlayer = player.location
         val chunkCoord = ChunkCoord.fromBlockCoords(locPlayer.getBlockX(), locPlayer.getBlockZ())
         val source = Ports.chunkToPort.get(chunkCoord)
-        if ( source === null ) {
+        if (source === null) {
             Message.print(player, "${ChatColor.RED}You must be at a port to warp to another port")
             return
-        }
-        else {
+        } else {
             val px = player.location.x
             val pz = player.location.z
-            if ( px < source.warpXMin || px > source.warpXMax || pz < source.warpZMin || pz > source.warpZMax ) {
+            if (px < source.warpXMin || px > source.warpXMax || pz < source.warpZMin || pz > source.warpZMax) {
                 Message.error(player, "You must be <${maxDistanceFromPortToWarp} of the port to warp")
                 return
             }
@@ -1324,19 +1504,19 @@ public object Ports {
 
         // check if port exists
         val destination = Ports.ports.get(destinationName.lowercase())
-        if ( destination === null ) {
+        if (destination === null) {
             Message.error(player, "Port does not exist...")
             return
         }
 
         // check if port is same
-        if ( source === destination ) {
+        if (source === destination) {
             Message.error(player, "You are already at this port...")
             return
         }
 
         // verify ports share groups
-        if ( !Ports.shareGroups(source, destination) ) {
+        if (!Ports.shareGroups(source, destination)) {
             Message.error(player, "These ports are not in the same region group...")
             return
         }
@@ -1346,22 +1526,21 @@ public object Ports {
         var costMaterial = Material.AIR
 
         // owned port, check permissions
-        if ( !destination.isPublic ) {
+        if (!destination.isPublic) {
             val owner = Ports.getPortOwner(destination)
-            if ( owner === null ) {
+            if (owner === null) {
                 // allow warp as if public for now
-            }
-            else {
+            } else {
                 val relation = Nodes.getRelationshipOfPlayerToTown(player, owner)
 
                 val access: Boolean
-                when ( relation ) {
+                when (relation) {
                     DiplomaticRelationship.TOWN,
                     DiplomaticRelationship.NATION -> {
                         access = true
                         cost = 0
                     }
-                    
+
                     DiplomaticRelationship.ALLY -> {
                         access = destination.allowAlly
                         cost = destination.costAlly
@@ -1377,22 +1556,30 @@ public object Ports {
                         cost = destination.costEnemy
                     }
                 }
-                
+
                 costMaterial = destination.costMaterial
 
-                if ( access == false ) {
-                    Message.error(player, "Port ${destinationName}'s owner ${owner.name} has closed access to you (${relation})")
+                if (access == false) {
+                    Message.error(
+                        player,
+                        "Port ${destinationName}'s owner ${owner.name} has closed access to you (${relation})"
+                    )
                     return
                 }
-                
+
                 // require confirmation if port has a fee
-                if ( cost > 0 && destination.costMaterial != Material.AIR && confirmed == false ) {
-                    if ( confirmed == false ) {
-                        Message.print(player, "${ChatColor.AQUA}Port ${destinationName}'s owner ${owner.name} has set a fee: ${cost} ${destination.costMaterial}, type \"/port warp ${destinationName} confirm\" to confirm warp")
+                if (cost > 0 && destination.costMaterial != Material.AIR && confirmed == false) {
+                    if (confirmed == false) {
+                        Message.print(
+                            player,
+                            "${ChatColor.AQUA}Port ${destinationName}'s owner ${owner.name} has set a fee: ${cost} ${destination.costMaterial}, type \"/port warp ${destinationName} confirm\" to confirm warp"
+                        )
                         return
-                    }
-                    else if ( !player.getInventory().contains(destination.costMaterial, cost) ) {
-                        Message.error(player, "You do not have enough to pay port ${destinationName}'s owner's ${owner.name} warp fee: ${cost} ${destination.costMaterial}")
+                    } else if (!player.getInventory().contains(destination.costMaterial, cost)) {
+                        Message.error(
+                            player,
+                            "You do not have enough to pay port ${destinationName}'s owner's ${owner.name} warp fee: ${cost} ${destination.costMaterial}"
+                        )
                         return
                     }
                 }
@@ -1407,17 +1594,16 @@ public object Ports {
 
         // 1. player by itself, no vehicle
         val entityVehicle = player.getVehicle()
-        if ( entityVehicle === null ) {
-            if ( !Ports.allowWarpWithoutBoat ) {
+        if (entityVehicle === null) {
+            if (!Ports.allowWarpWithoutBoat) {
                 Message.error(player, "You must be in a boat or a ship vehicle to warp to ports")
                 return
             }
 
             playersToWarp.add(player)
-        }
-        else {
+        } else {
             // 2. player in a boat
-            if ( entityVehicle.type == EntityType.BOAT ) {
+            if (entityVehicle.type == EntityType.BOAT) {
                 entitiesToWarp.add(entityVehicle)
             }
             // // 3. player in a custom plugin vehicle (ArmorStand only)
@@ -1438,7 +1624,7 @@ public object Ports {
             warpTime,
             2.0
         )
-        
+
         // run asynchronous warp timer
         Ports.playerWarpTasks.put(
             player.getUniqueId(),
@@ -1459,23 +1645,23 @@ public object Ports {
         val costAmount: Int,
         val timeWarp: Double,
         val tick: Double
-    ): BukkitRunnable() {
+    ) : BukkitRunnable() {
         private val locX = initialLoc.getBlockX()
         private val locY = initialLoc.getBlockY()
         private val locZ = initialLoc.getBlockZ()
-    
+
         // remaining time counter
         private var time = timeWarp
-    
+
         override fun run() {
             // check if player moved
             val location = player.location
-            if ( locX != location.getBlockX() || locY != location.getBlockY() || locZ != location.getBlockZ() ) {
+            if (locX != location.getBlockX() || locY != location.getBlockY() || locZ != location.getBlockZ()) {
                 Message.announcement(player, "${ChatColor.RED}Moved! Stopped warping...")
                 this.cancel()
 
                 // schedule main thread to remove cancelled task
-                Bukkit.getScheduler().runTask(Ports.plugin!!, object: Runnable {
+                Bukkit.getScheduler().runTask(Ports.plugin!!, object : Runnable {
                     override public fun run() {
                         Ports.playerWarpTasks.remove(player.getUniqueId())
                     }
@@ -1483,24 +1669,28 @@ public object Ports {
 
                 return
             }
-            
+
             time -= tick
-            
-            if ( time <= 0.0 ) {
+
+            if (time <= 0.0) {
                 this.cancel()
 
                 // schedule main thread to finish warp
-                Bukkit.getScheduler().runTask(Ports.plugin!!, object: Runnable {
+                Bukkit.getScheduler().runTask(Ports.plugin!!, object : Runnable {
                     override public fun run() {
                         Ports.playerWarpTasks.remove(player.getUniqueId())
-                
-                        // remove cost from player
-                        val playerInventory = player.getInventory()
-                        if ( playerInventory.contains(costMaterial, costAmount) ) {
-                            playerInventory.removeItem(ItemStack(costMaterial, costAmount))
-                        } else {
-                            Message.announcement(player, "${ChatColor.RED}You do not have enough to pay warp fee (${costAmount} ${costMaterial})...")
-                            return
+
+                        if (costAmount > 0 && costMaterial != Material.AIR) {
+                            val inv = player.inventory
+                            if (inv.contains(costMaterial, costAmount)) {
+                                inv.removeItem(ItemStack(costMaterial, costAmount))
+                            } else {
+                                Message.announcement(
+                                    player,
+                                    "${ChatColor.RED}No tienes suficiente (${costAmount} ${costMaterial}) para pagar la tarifa..."
+                                )
+                                return
+                            }
                         }
 
                         // do warp
@@ -1513,8 +1703,7 @@ public object Ports {
                         Message.announcement(player, "${ChatColor.GREEN}Warped to ${destination.name}")
                     }
                 })
-            }
-            else {
+            } else {
                 val progress = 1.0 - (time / timeWarp)
                 Message.announcement(player, "Warping ${ChatColor.GREEN}${progressBar(progress)}")
             }
@@ -1540,17 +1729,17 @@ public object Ports {
         val zoffset0 = rand.nextDouble() * Ports.maxDistanceFromPortToWarp
 
         // require |x|, |z| > 1.5 so don't get stuck in pillar
-        val xoff = if ( xoffset0 > 0.0 && xoffset0 < 1.5 ) {
+        val xoff = if (xoffset0 > 0.0 && xoffset0 < 1.5) {
             1.5
-        } else if ( xoffset0 < 0.0 && xoffset0 > -1.5 ) {
+        } else if (xoffset0 < 0.0 && xoffset0 > -1.5) {
             -1.5
         } else {
             xoffset0
         }
 
-        val zoff = if ( zoffset0 > 0.0 && zoffset0 < 1.5 ) {
+        val zoff = if (zoffset0 > 0.0 && zoffset0 < 1.5) {
             1.5
-        } else if ( zoffset0 < 0.0 && zoffset0 > -1.5 ) {
+        } else if (zoffset0 < 0.0 && zoffset0 > -1.5) {
             -1.5
         } else {
             zoffset0
@@ -1559,7 +1748,7 @@ public object Ports {
         val x = portX + xoff
         val z = portZ + zoff
 
-        for ( player in playersToWarp ) {
+        for (player in playersToWarp) {
             val loc = Location(
                 Ports.defaultWorld,
                 x,
@@ -1570,7 +1759,7 @@ public object Ports {
             player.teleport(loc)
         }
 
-        for ( entity in entitiesToWarp ) {
+        for (entity in entitiesToWarp) {
             val loc = Location(
                 Ports.defaultWorld,
                 x,
@@ -1599,43 +1788,90 @@ public object Ports {
     /**
      * Handle warping entity which may have passenger
      */
-    public fun teleportEntity(entity: Entity, destination: Location) {
-        val passengers = entity.getPassengers()
+    fun teleportEntity(entity: Entity, dest: Location) {
+        // 1) Chunk destino cargado
+        dest.chunk.load()
 
-        // remove players from boats and teleport to destination
-        for ( p in passengers ) {
-            p.eject()
-            entity.removePassenger(p)
-            p.teleport(destination)
-        }
+        // 2) Pasajeros fuera
+        val passengers = entity.passengers.toList()
+        passengers.forEach { entity.removePassenger(it) }
 
-        // schedule entity teleport (after players already teleported)
-        Bukkit.getScheduler().runTaskLater(Ports.plugin!!, object: Runnable {
-            override public fun run() {
-                entity.teleport(destination)
+        // 3) Mover vehículo en el hilo principal
+        Bukkit.getScheduler().runTask(Ports.plugin!!, object : Runnable {
+            override fun run() {
+                entity.teleport(dest)
 
-                // re-send entity to players to make sure it exists on client
-                for ( p in passengers ) {
-                    try {
-                        val nmsPlayer = (p as CraftPlayer).getHandle()
-                        val nmsEntity = (entity as CraftEntity).getHandle()
-                        nmsPlayer.connection.send(ClientboundAddEntityPacket(nmsEntity))
-                    } catch ( err: Exception ) {
-                        if ( Ports.debug ) {
-                            err.printStackTrace()
+                // 4) Re-montar 2 ticks después
+                Bukkit.getScheduler().runTaskLater(
+                    Ports.plugin!!,
+                    object : Runnable {
+                        override fun run() {
+                            passengers.forEach { entity.addPassenger(it) }
                         }
-                    }
-                }
+                    },
+                    2L
+                )
             }
-        }, 1L)
+        })
+    }
 
-        // schedule re-attaching player to boat
-        Bukkit.getScheduler().runTaskLater(Ports.plugin!!, object: Runnable {
-            override public fun run() {
-                for ( p in passengers ) {
-                    entity.addPassenger(p)
-                }
-            }
-        }, 2L)
+    /**
+     * Versión múltiple: admite varios grupos.
+     */
+    fun createPort(name: String, locX: Int, locZ: Int, groups: List<String>, isPublic: Boolean = true): Boolean {
+        val plugin = plugin ?: return false
+        val file   = plugin.dataFolder.toPath().resolve("ports.yml").toFile()
+        val cfg    = YamlConfiguration.loadConfiguration(file)
+
+        /* 1. garantizar que los grupos están en la lista global */
+        val listInYaml = cfg.getStringList("groups").map { it.lowercase() }.toMutableList()
+        groups.forEach { g ->
+            if (g !in listInYaml) listInYaml += g
+        }
+        cfg.set("groups", listInYaml)
+
+        /* 2. sección del puerto */
+        val section = cfg.createSection("ports.$name")
+        section.set("x", locX)
+        section.set("z", locZ)
+        section.set("group", groups)       // ← acepta lista
+        section.set("public", isPublic)
+
+        cfg.save(file)
+        loadPorts()                         // refresco rápido
+        return true
+    }
+
+    /**
+     * Elimina un puerto del YAML y refresca las estructuras internas.
+     *
+     * @return true si se borró correctamente.
+     */
+    fun deletePort(name: String): Boolean {
+        val plugin = plugin ?: return false
+        val file = plugin.dataFolder.toPath().resolve("ports.yml").toFile()
+        val cfg = YamlConfiguration.loadConfiguration(file)
+
+        val section = cfg.getConfigurationSection("ports") ?: return false
+        if (!section.isConfigurationSection(name)) return false
+
+        // 1. Quitar la sección del puerto
+        section.set(name, null)
+
+        // 2. Actualizar lista de grupos (quitar los vacíos)
+        val groupsInYaml = cfg.getStringList("groups").map { it.lowercase() }.toMutableList()
+        val portsSection = cfg.getConfigurationSection("ports")
+        groupsInYaml.removeIf { g ->
+            portsSection?.getKeys(false)?.none { pn ->
+                portsSection.getConfigurationSection(pn)?.getString("group")?.lowercase() == g
+            } ?: true
+        }
+        cfg.set("groups", groupsInYaml)
+
+        // 3. Guardar y recargar
+        cfg.save(file)
+        loadPorts()
+
+        return true
     }
 }
